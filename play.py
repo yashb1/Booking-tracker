@@ -1,7 +1,10 @@
+# play.py — updated: booking form removes is_advance & status; finance tab has cascading selectors;
+# shows persistent success message after add booking (via st.session_state.last_booking).
 import streamlit as st
 import pandas as pd
 import os
-from datetime import datetime, date, time, timedelta
+import time
+from datetime import datetime, date, time as dtime, timedelta
 import altair as alt
 from io import BytesIO
 
@@ -11,18 +14,28 @@ from io import BytesIO
 CSV_PATH = "bookings.csv"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# "Players Turf Goregaon" added at TOP as requested
-TURFS = [
-    "Players Turf Goregaon",
-    "SV Andheri - Turf 1", "SV Andheri - Turf 2",
-    "SV Malad - Turf 1", "SV Malad - Turf 2",
-    "SV Thane - Turf 1", "SV Thane - Turf 2",
-    "SV Kandivali - Turf 1", "SV Kandivali - Turf 2",
-    "SV Borivali - Turf 1", "SV Borivali - Turf 2",
-    "SV Dadar", "SV Churchgate", "SV Bandra", "SV Chembur",
-    "SV Vashi", "SV Pune", "SV Nashik", "SV Nagpur",
-    "SV Surat", "SV Ahmedabad", "SV Goregaon"
-]
+# =====================================================
+# VENUES / COURTS (structured per your list)
+# =====================================================
+VENUES_BY_CITY = {
+    "Mumbai": {
+        "ISF - Mira road": ["Turf 1", "Turf 2"],
+        "Lush - Mira road (Cricket only)": ["Turf 1", "Turf 2", "Turf 3"],
+        "Ninestar": ["Turf 1 (Football)", "Turf 2 (Cricket)", "Cricket nets 1", "Cricket nets 2", "Bowling machine"],
+        "Player's turf Kanchpada": ["Turf 1", "Turf 2"],
+        "Players turf Goregaon": ["Turf 1", "Turf 2", "Turf 3 (Cricket only)"],
+        "Players turf Mittal": ["Turf 1", "Turf 2", "Turf 3", "Turf 4"],
+        "Shanti Park Ghatkopar": ["Turf 1"],
+    },
+    "Delhi": {
+        "Sportvot Play Base Chattarpur": ["Turf 1", "Turf 2"],
+        "Sportvot Play Base Ghitorni": ["Turf 1"],
+        "Sportvot Play Base Turf Pro": ["Turf 1 (Cricket)"]
+    }
+}
+
+def flatten_turf_label(city, venue, court):
+    return f"{city} | {venue} | {court}"
 
 PLATFORMS = ["Huddle", "KheloMore", "SportVot Direct", "Event Company", "Turf Owner (Direct)"]
 PAYMENT_METHODS = ["Cash", "SV Paytm", "Huddle Payout", "KheloMore Payout", "Bank Transfer"]
@@ -31,24 +44,44 @@ STATUSES = ["Pending", "Paid", "Received in Bank"]
 # =====================================================
 # HELPERS
 # =====================================================
+def safe_rerun():
+    """Rerun the app safely across different Streamlit versions."""
+    try:
+        if hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()
+        elif hasattr(st, "rerun"):
+            st.rerun()
+        else:
+            st.experimental_set_query_params(_rerun=str(time.time()))
+            st.stop()
+    except Exception:
+        try:
+            st.experimental_set_query_params(_rerun=str(time.time()))
+        except Exception:
+            pass
+        st.stop()
+
 def ensure_csv_exists(path=CSV_PATH):
     if not os.path.exists(path):
         df = pd.DataFrame(columns=[
-            "booking_id", "created_on", "date", "end_time", "turf_name", "platform",
-            "payment_method", "amount", "amount_paid", "is_advance", "status", "remarks",
-            "created_by", "booking_name"
+            "booking_id", "created_on", "date", "end_time",
+            "city", "venue", "court", "turf_name",
+            "platform", "payment_method", "amount", "amount_paid",
+            "is_advance", "status", "remarks", "created_by", "booking_name"
         ])
         df.to_csv(path, index=False)
 
 def load_data(path=CSV_PATH):
     ensure_csv_exists(path)
     df = pd.read_csv(path)
-    # Ensure expected columns exist (backwards compatibility)
-    for col, default in [("end_time", ""), ("amount_paid", 0.0), ("is_advance", False), ("booking_name", "")]:
+    for col, default in [
+        ("end_time", ""), ("city", ""), ("venue", ""), ("court", ""),
+        ("turf_name", ""), ("amount_paid", 0.0), ("is_advance", False),
+        ("booking_name", "")
+    ]:
         if col not in df.columns:
             df[col] = default
 
-    # parse datetimes safely
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if "end_time" in df.columns:
@@ -60,7 +93,6 @@ def load_data(path=CSV_PATH):
     if "amount_paid" in df.columns:
         df["amount_paid"] = pd.to_numeric(df["amount_paid"], errors="coerce").fillna(0)
     if "is_advance" in df.columns:
-        # handle strings like "True"/"False"
         df["is_advance"] = df["is_advance"].astype(bool)
     return df
 
@@ -92,7 +124,7 @@ def to_excel_bytes(df):
     return buffer.getvalue()
 
 # slot utilities
-def generate_time_slots(start=time(6,0), end=time(23,30), step_minutes=30):
+def generate_time_slots(start=dtime(6,0), end=dtime(23,30), step_minutes=30):
     slots = []
     cur = datetime.combine(date.today(), start)
     end_dt = datetime.combine(date.today(), end)
@@ -101,14 +133,14 @@ def generate_time_slots(start=time(6,0), end=time(23,30), step_minutes=30):
         cur += timedelta(minutes=step_minutes)
     return slots
 
-def format_slot(t: time):
+def format_slot(t: dtime):
     return t.strftime("%H:%M")
 
-def format_slot_range(t: time, duration_minutes: int = 30):
+def format_slot_range(t: dtime, duration_minutes: int = 30):
     end_time = (datetime.combine(date.today(), t) + timedelta(minutes=duration_minutes)).time()
     return f"{format_slot(t)}-{format_slot(end_time)}"
 
-def slots_to_datetimes(slot_time: time, slot_date: date):
+def slots_to_datetimes(slot_time: dtime, slot_date: date):
     return datetime.combine(slot_date, slot_time)
 
 def ranges_overlap(a_start, a_end, b_start, b_end):
@@ -131,15 +163,27 @@ def selected_slots_contiguous(selected_times):
 st.set_page_config(page_title="SportVot Play — Finance & Booking Tracker", layout="wide")
 st.title("🏟️ SportVot Play — Finance & Booking Tracker")
 
+# Keep Department radio in sidebar only
 department = st.sidebar.radio("Select Department", ["Operations", "Finance"], key="dept_select")
 st.sidebar.markdown("---")
 
-if department == "Operations":
-    selected_turf = st.sidebar.selectbox("Select your turf", TURFS, key="ops_turf")
-else:
-    selected_turf = st.sidebar.selectbox("Focus on Turf (optional)", ["All Turfs"] + TURFS, key="fin_turf")
+# initialize session df
+if "df" not in st.session_state:
+    st.session_state.df = load_data()
 
-df = load_data()
+# sensible defaults for form-level selectors
+default_city = list(VENUES_BY_CITY.keys())[0]
+default_venue = list(VENUES_BY_CITY[default_city].keys())[0]
+default_court = VENUES_BY_CITY[default_city][default_venue][0]
+
+if "form_city" not in st.session_state:
+    st.session_state.form_city = default_city
+if "form_venue" not in st.session_state:
+    st.session_state.form_venue = default_venue
+if "form_court" not in st.session_state:
+    st.session_state.form_court = default_court
+
+df = st.session_state.df
 
 # =====================================================
 # OPERATIONS SECTION
@@ -154,14 +198,28 @@ if department == "Operations":
         date_from = st.date_input("From", value=date.today().replace(day=1), key="ops_dash_from")
         date_to = st.date_input("To", value=date.today(), key="ops_dash_to")
 
-        df_dash = df[df["turf_name"] == selected_turf].copy()
+        # Dashboard uses current form-level selections if present
+        sel_city = st.session_state.get("form_city", default_city)
+        sel_venue = st.session_state.get("form_venue", default_venue)
+        sel_court = st.session_state.get("form_court", default_court)
+
+        df_dash = df.copy()
+        if "city" in df_dash.columns:
+            df_dash = df_dash[
+                (df_dash["city"] == sel_city) &
+                (df_dash["venue"] == sel_venue) &
+                (df_dash["court"] == sel_court)
+            ]
+        else:
+            df_dash = df_dash[df_dash["turf_name"] == flatten_turf_label(sel_city, sel_venue, sel_court)]
+
         df_dash["date_only"] = pd.to_datetime(df_dash["date"], errors="coerce").dt.date
         df_dash = df_dash[(df_dash["date_only"] >= date_from) & (df_dash["date_only"] <= date_to)]
 
         total_bookings = len(df_dash)
         total_amount = df_dash["amount"].sum()
         paid_amount = df_dash["amount_paid"].sum()
-        pending_amount = df_dash["amount"].sum() - df_dash["amount_paid"].sum()
+        pending_amount = total_amount - paid_amount
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Bookings", f"{total_bookings:,}")
@@ -172,14 +230,80 @@ if department == "Operations":
     with tabs[1]:
         st.header("✍️ Booking Entry")
 
+        # If a previous save set this flag, reset widget-backed session keys BEFORE widgets are created
+        if st.session_state.get("should_clear_form", False):
+            st.session_state.entry_selected_slots = []
+            st.session_state.entry_booking_name = ""
+            st.session_state.entry_amount = 1400
+            st.session_state.entry_amount_paid = 0.0
+            st.session_state.entry_remarks = ""
+            st.session_state.entry_platform = PLATFORMS[0]
+            st.session_state.entry_payment = PAYMENT_METHODS[0]
+            # reset form-level selectors to defaults
+            st.session_state.form_city = default_city
+            st.session_state.form_venue = default_venue
+            st.session_state.form_court = default_court
+            del st.session_state["should_clear_form"]
+
+        # If there's a last booking (created in prior run), show the persistent success message and then clear it
+        if "last_booking" in st.session_state:
+            lb = st.session_state.pop("last_booking")
+            # lb is dict with key details; show a friendly formatted success box
+            st.success(f"✅ Booking {lb.get('booking_id')} added for {lb.get('city')} | {lb.get('venue')} | {lb.get('court')} — "
+                       f"{lb.get('time_range')} — ₹{int(lb.get('amount',0)):,} (Paid: ₹{int(lb.get('amount_paid',0)):,})")
+
         all_slots = generate_time_slots()  # 30-min slots
 
-        with st.form("booking_form", clear_on_submit=True):
-            booking_name = st.text_input("Booking Name / Team Name", key="entry_booking_name")
+        # initialize defaults for widget-backed keys if missing
+        if "entry_selected_slots" not in st.session_state:
+            st.session_state.entry_selected_slots = []
+        if "entry_booking_name" not in st.session_state:
+            st.session_state.entry_booking_name = ""
+        if "entry_amount" not in st.session_state:
+            st.session_state.entry_amount = 1400
+        if "entry_amount_paid" not in st.session_state:
+            st.session_state.entry_amount_paid = 0.0
+        if "entry_remarks" not in st.session_state:
+            st.session_state.entry_remarks = ""
+        if "entry_platform" not in st.session_state:
+            st.session_state.entry_platform = PLATFORMS[0]
+        if "entry_payment" not in st.session_state:
+            st.session_state.entry_payment = PAYMENT_METHODS[0]
+
+        # defaults for form-level selectors already in session_state
+
+        # Booking form — includes form-level City/Venue/Court selectors
+        with st.form("booking_form", clear_on_submit=False):
+            # FORM-LEVEL cascading selectors
+            form_city = st.selectbox("Select City", list(VENUES_BY_CITY.keys()),
+                                     index=list(VENUES_BY_CITY.keys()).index(st.session_state.form_city) if st.session_state.form_city in VENUES_BY_CITY else 0,
+                                     key="form_city")
+            form_venues = list(VENUES_BY_CITY.get(form_city, {}).keys())
+            default_venue_index = 0
+            if st.session_state.form_venue in form_venues:
+                default_venue_index = form_venues.index(st.session_state.form_venue)
+            form_venue = st.selectbox("Select Venue", form_venues, index=default_venue_index, key="form_venue")
+            form_courts = VENUES_BY_CITY.get(form_city, {}).get(form_venue, [])
+            default_court_index = 0
+            if st.session_state.form_court in form_courts:
+                default_court_index = form_courts.index(st.session_state.form_court)
+            form_court = st.selectbox("Select Court", form_courts, index=default_court_index, key="form_court")
+
+            # rest of booking fields (note: removed is_advance and status here)
+            booking_name = st.text_input("Booking Name / Team Name", value=st.session_state.entry_booking_name, key="entry_booking_name")
             b_date = st.date_input("Booking Date", value=date.today(), key="entry_date")
 
-            df_current = load_data()
-            turf_bookings = df_current[df_current["turf_name"] == selected_turf].copy()
+            # Determine booked ranges for selected form-level city/venue/court and date
+            df_current = st.session_state.df.copy()
+            if "city" in df_current.columns:
+                turf_bookings = df_current[
+                    (df_current["city"] == form_city) &
+                    (df_current["venue"] == form_venue) &
+                    (df_current["court"] == form_court)
+                ].copy()
+            else:
+                turf_bookings = df_current[df_current["turf_name"] == flatten_turf_label(form_city, form_venue, form_court)].copy()
+
             turf_bookings["date_only"] = pd.to_datetime(turf_bookings["date"], errors="coerce").dt.date
             turf_bookings = turf_bookings[turf_bookings["date_only"] == b_date]
 
@@ -203,25 +327,28 @@ if department == "Operations":
                     available_slots.append(slot)
 
             if not available_slots:
-                st.warning("No available time slots for this turf & date. Choose another date or turf.")
+                st.warning("No available time slots for this court & date. Choose another date or court.")
 
-            # create labels as ranges "HH:MM-HH:MM"
             slot_labels = [format_slot_range(s) for s in available_slots]
-            selected_slot_labels = st.multiselect("Select contiguous half-hour slots (e.g., 14:00-14:30, 14:30-15:00 for 1 hour)", slot_labels, key="entry_selected_slots") if available_slots else []
-            # parse selected labels: get start part before '-' and convert to time
+            selected_slot_labels = st.multiselect(
+                "Select contiguous half-hour slots (e.g., 14:00-14:30, 14:30-15:00 for 1 hour)",
+                slot_labels,
+                default=st.session_state.entry_selected_slots,
+                key="entry_selected_slots"
+            ) if available_slots else []
+
             selected_slots = []
             for lbl in selected_slot_labels:
                 try:
                     start_str = lbl.split("-")[0].strip()
                     selected_slots.append(datetime.strptime(start_str, "%H:%M").time())
                 except Exception:
-                    # fallback ignore malformed
                     continue
 
             if selected_slot_labels and not selected_slots_contiguous(selected_slots):
                 st.error("Selected slots are not contiguous. Please select contiguous half-hour slots (adjacent).")
 
-            platform = st.selectbox("Platform", PLATFORMS, key="entry_platform")
+            platform = st.selectbox("Platform", PLATFORMS, index=PLATFORMS.index(st.session_state.entry_platform) if st.session_state.entry_platform in PLATFORMS else 0, key="entry_platform")
 
             if platform == "Huddle":
                 payment_method = "Huddle Payout"
@@ -230,16 +357,15 @@ if department == "Operations":
             elif platform == "Event Company":
                 payment_method = "Bank Transfer"
             else:
-                payment_method = st.selectbox("Payment Method", ["Cash", "SV Paytm", "Bank Transfer"], key="entry_payment")
+                payment_method = st.selectbox("Payment Method", PAYMENT_METHODS, index=PAYMENT_METHODS.index(st.session_state.entry_payment) if st.session_state.entry_payment in PAYMENT_METHODS else 0, key="entry_payment")
 
-            amount = st.number_input("Booking Amount (INR)", min_value=0, step=100, value=1400, key="entry_amount")
-            is_advance = st.checkbox("Is this an advance payment?", key="entry_is_advance")
-            amount_paid = st.number_input("Amount Paid Now (INR)", min_value=0.0, step=100.0, value=0.0, key="entry_amount_paid")
-            status = st.selectbox("Status", STATUSES, index=0, key="entry_status")
-            remarks = st.text_input("Remarks (optional, max 100 chars)", key="entry_remarks", max_chars=100)
+            amount = st.number_input("Booking Amount (INR)", min_value=0, step=100, value=st.session_state.entry_amount, key="entry_amount")
+            amount_paid = st.number_input("Amount Paid Now (INR)", min_value=0.0, step=100.0, value=st.session_state.entry_amount_paid, key="entry_amount_paid")
+            remarks = st.text_input("Remarks (optional, max 100 chars)", value=st.session_state.entry_remarks, key="entry_remarks", max_chars=100)
             submitted = st.form_submit_button("➕ Add Booking")
 
             if submitted:
+                # validations
                 if not booking_name:
                     st.error("❌ Please enter Booking Name / Team Name.")
                 elif not selected_slots:
@@ -255,9 +381,17 @@ if department == "Operations":
                     chosen_start_dt = slots_to_datetimes(sorted_slots[0], b_date)
                     chosen_end_dt = slots_to_datetimes(sorted_slots[-1], b_date) + timedelta(minutes=30)
 
+                    # final overlap check against latest data
                     conflict = False
                     df_now = load_data()
-                    df_now_turf = df_now[df_now["turf_name"] == selected_turf].copy()
+                    if "city" in df_now.columns:
+                        df_now_turf = df_now[
+                            (df_now["city"] == form_city) &
+                            (df_now["venue"] == form_venue) &
+                            (df_now["court"] == form_court)
+                        ].copy()
+                    else:
+                        df_now_turf = df_now[df_now["turf_name"] == flatten_turf_label(form_city, form_venue, form_court)].copy()
                     df_now_turf["date_only"] = pd.to_datetime(df_now_turf["date"], errors="coerce").dt.date
                     df_now_turf = df_now_turf[df_now_turf["date_only"] == b_date]
                     for _, row in df_now_turf.iterrows():
@@ -276,39 +410,82 @@ if department == "Operations":
                         df_current = df_now
                         new_id = generate_booking_id(df_current)
                         created_on = datetime.now().strftime(DATE_FORMAT)
+                        turf_name = flatten_turf_label(form_city, form_venue, form_court)
+                        # is_advance removed from form, default False; status default "Pending"
                         new_row = {
                             "booking_id": new_id,
                             "created_on": created_on,
                             "date": chosen_start_dt.strftime(DATE_FORMAT),
                             "end_time": chosen_end_dt.strftime(DATE_FORMAT),
-                            "turf_name": selected_turf,
+                            "city": form_city,
+                            "venue": form_venue,
+                            "court": form_court,
+                            "turf_name": turf_name,
                             "platform": platform,
                             "payment_method": payment_method,
                             "amount": float(amount),
                             "amount_paid": float(amount_paid),
-                            "is_advance": bool(is_advance),
-                            "status": status,
+                            "is_advance": False,
+                            "status": "Pending",
                             "remarks": remarks,
                             "created_by": "Operations",
                             "booking_name": booking_name
                         }
                         df_current = pd.concat([df_current, pd.DataFrame([new_row])], ignore_index=True)
                         save_data(df_current)
-                        st.success(f"✅ Booking {new_id} added for {selected_turf} — {format_slot_range(sorted_slots[0], (len(sorted_slots)*30))} — ₹{amount:,} (Paid: ₹{amount_paid:,})")
+                        # update in-memory dataset
+                        st.session_state.df = load_data()
+                        # store last booking into session_state so message persists after rerun
+                        st.session_state.last_booking = {
+                            "booking_id": new_id,
+                            "city": form_city,
+                            "venue": form_venue,
+                            "court": form_court,
+                            "time_range": f"{format_slot_range(sorted_slots[0], (len(sorted_slots) * 30))}",
+                            "amount": int(amount),
+                            "amount_paid": int(amount_paid)
+                        }
+                        # mark to clear on next run
+                        st.session_state.should_clear_form = True
+                        safe_rerun()
 
     # --- OPS REPORTS ---
     with tabs[2]:
         st.header("📑 Ops Reports")
         rep_from = st.date_input("From", value=date.today().replace(day=1), key="ops_rep_from")
         rep_to = st.date_input("To", value=date.today(), key="ops_rep_to")
-        rep_df = df[df["turf_name"] == selected_turf].copy()
+
+        # Use form-level selections for reports (fallback to defaults if not set)
+        sel_city = st.session_state.get("form_city", default_city)
+        sel_venue = st.session_state.get("form_venue", default_venue)
+        sel_court = st.session_state.get("form_court", default_court)
+
+        rep_df = st.session_state.df.copy()
+        if "city" in rep_df.columns:
+            rep_df = rep_df[
+                (rep_df["city"] == sel_city) &
+                (rep_df["venue"] == sel_venue) &
+                (rep_df["court"] == sel_court)
+            ].copy()
+        else:
+            rep_df = rep_df[rep_df["turf_name"] == flatten_turf_label(sel_city, sel_venue, sel_court)].copy()
+
         rep_df["date_only"] = pd.to_datetime(rep_df["date"], errors="coerce").dt.date
         rep_df = rep_df[(rep_df["date_only"] >= rep_from) & (rep_df["date_only"] <= rep_to)]
         st.write(f"Report rows: {len(rep_df)}")
 
-        st.markdown("### 🕒 Visual Timeline — selected turf & date")
+        st.markdown("### 🕒 Visual Timeline — selected court & date")
         timeline_date = st.date_input("Timeline Date", value=date.today(), key="timeline_date")
-        timeline_df = df[df["turf_name"] == selected_turf].copy()
+        timeline_df = st.session_state.df.copy()
+        if "city" in timeline_df.columns:
+            timeline_df = timeline_df[
+                (timeline_df["city"] == sel_city) &
+                (timeline_df["venue"] == sel_venue) &
+                (timeline_df["court"] == sel_court)
+            ].copy()
+        else:
+            timeline_df = timeline_df[timeline_df["turf_name"] == flatten_turf_label(sel_city, sel_venue, sel_court)].copy()
+
         timeline_df["start_dt"] = pd.to_datetime(timeline_df["date"], errors="coerce")
         timeline_df["end_dt"] = pd.to_datetime(timeline_df["end_time"], errors="coerce")
         timeline_df["date_only"] = timeline_df["start_dt"].dt.date
@@ -324,7 +501,7 @@ if department == "Operations":
             ).properties(height=300)
             st.altair_chart(chart, use_container_width=True)
         else:
-            st.info("No bookings for this turf on timeline date.")
+            st.info("No bookings for this court on timeline date.")
 
         st.dataframe(rep_df, height=300)
 
@@ -338,12 +515,11 @@ if department == "Operations":
                     if st.button("Edit Booking", key="edit_booking_btn"):
                         with st.form("edit_form", clear_on_submit=False):
                             edit_booking_name = st.text_input("Booking Name", value=sel_row.get("booking_name", ""), key="edit_booking_name")
-                            # Defensive: handle missing datetimes
                             start_dt = sel_row["date"] if pd.notnull(sel_row["date"]) else pd.NaT
                             end_dt = sel_row["end_time"] if pd.notnull(sel_row["end_time"]) else pd.NaT
                             edit_date = st.date_input("Start Date", value=start_dt.date() if not pd.isna(start_dt) else date.today(), key="edit_date")
-                            edit_start_time = st.time_input("Start Time", value=start_dt.time() if not pd.isna(start_dt) else time(9,0), key="edit_start_time")
-                            edit_end_time = st.time_input("End Time", value=end_dt.time() if not pd.isna(end_dt) else time(10,0), key="edit_end_time")
+                            edit_start_time = st.time_input("Start Time", value=start_dt.time() if not pd.isna(start_dt) else dtime(9,0), key="edit_start_time")
+                            edit_end_time = st.time_input("End Time", value=end_dt.time() if not pd.isna(end_dt) else dtime(10,0), key="edit_end_time")
                             edit_platform = st.selectbox("Platform", PLATFORMS, index=PLATFORMS.index(sel_row["platform"]) if sel_row["platform"] in PLATFORMS else 0, key="edit_platform")
                             edit_payment_method = st.selectbox("Payment Method", PAYMENT_METHODS, index=PAYMENT_METHODS.index(sel_row["payment_method"]) if sel_row["payment_method"] in PAYMENT_METHODS else 0, key="edit_payment_method")
                             edit_amount = st.number_input("Amount (INR)", min_value=0, step=100, value=float(sel_row.get("amount", 0)), key="edit_amount")
@@ -359,7 +535,12 @@ if department == "Operations":
                                     st.error("End time must be after start time.")
                                 else:
                                     df_now = load_data()
-                                    others = df_now[(df_now["turf_name"] == selected_turf) & (df_now["booking_id"] != sel_booking_id)].copy()
+                                    others = df_now[
+                                        (df_now["city"] == sel_row.get("city")) &
+                                        (df_now["venue"] == sel_row.get("venue")) &
+                                        (df_now["court"] == sel_row.get("court")) &
+                                        (df_now["booking_id"] != sel_booking_id)
+                                    ].copy() if "city" in df_now.columns else df_now[(df_now["turf_name"] == sel_row.get("turf_name")) & (df_now["booking_id"] != sel_booking_id)].copy()
                                     for _, r in others.iterrows():
                                         s = r.get("date"); e = r.get("end_time")
                                         if pd.notnull(s) and pd.notnull(e):
@@ -382,10 +563,10 @@ if department == "Operations":
                                             "Operations"
                                         ]
                                         save_data(df_now)
+                                        st.session_state.df = load_data()
                                         st.success("✅ Booking updated.")
-                                        st.experimental_rerun()
+                                        safe_rerun()
                 with col2:
-                    # Replacement for st.confirm(): two-step confirm via checkbox + button
                     if "delete_confirm" not in st.session_state:
                         st.session_state.delete_confirm = False
                     if st.button("Delete Booking", key="delete_booking_btn"):
@@ -397,12 +578,12 @@ if department == "Operations":
                             df_now = load_data()
                             df_now = df_now[df_now["booking_id"] != sel_booking_id]
                             save_data(df_now)
+                            st.session_state.df = load_data()
                             st.success(f"Deleted booking {sel_booking_id}.")
-                            # reset flag and rerun
                             st.session_state.delete_confirm = False
-                            st.experimental_rerun()
+                            safe_rerun()
         else:
-            st.info("No bookings available for this turf/date range.")
+            st.info("No bookings available for this court/date range.")
 
         csv_bytes = rep_df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="ops_report.csv", mime="text/csv", key="ops_csv")
@@ -420,12 +601,31 @@ else:
         date_from = st.date_input("From", value=date.today().replace(day=1), key="fin_dash_from")
         date_to = st.date_input("To", value=date.today(), key="fin_dash_to")
 
-        df_dash = df.copy()
+        # FINANCE cascading selectors (same UX as booking form, but with "All" options)
+        fin_city = st.selectbox("City", ["All Cities"] + list(VENUES_BY_CITY.keys()), key="fin_city")
+        fin_venue = None
+        fin_court = None
+        if fin_city != "All Cities":
+            venue_list = list(VENUES_BY_CITY.get(fin_city, {}).keys())
+            fin_venue = st.selectbox("Venue", ["All Venues"] + venue_list, key="fin_venue")
+            if fin_venue != "All Venues":
+                court_list = VENUES_BY_CITY.get(fin_city, {}).get(fin_venue, [])
+                fin_court = st.selectbox("Court", ["All Courts"] + court_list, key="fin_court")
+            else:
+                fin_court = st.selectbox("Court", ["All Courts"], key="fin_court")
+        else:
+            fin_venue = st.selectbox("Venue", ["All Venues"], key="fin_venue")
+            fin_court = st.selectbox("Court", ["All Courts"], key="fin_court")
+
+        df_dash = st.session_state.df.copy()
         df_dash["date_only"] = pd.to_datetime(df_dash["date"], errors="coerce").dt.date
         df_dash = df_dash[(df_dash["date_only"] >= date_from) & (df_dash["date_only"] <= date_to)]
-
-        if selected_turf != "All Turfs":
-            df_dash = df_dash[df_dash["turf_name"] == selected_turf]
+        if fin_city != "All Cities":
+            df_dash = df_dash[df_dash["city"] == fin_city]
+        if fin_venue != "All Venues":
+            df_dash = df_dash[df_dash["venue"] == fin_venue]
+        if fin_court != "All Courts":
+            df_dash = df_dash[df_dash["court"] == fin_court]
 
         total_bookings = len(df_dash)
         total_amount = df_dash["amount"].sum()
@@ -451,25 +651,38 @@ else:
             ).properties(width=700, height=350)
             st.altair_chart(chart, use_container_width=True)
 
-        if selected_turf == "All Turfs":
-            st.markdown("### 🏟️ Turf-wise Paid Summary")
-            turf_data = df_dash.groupby("turf_name")["amount_paid"].sum().reset_index().sort_values("amount_paid", ascending=False)
-            st.dataframe(turf_data, height=400)
+        st.markdown("### 🏟️ Court-wise Paid Summary")
+        turf_data = df_dash.groupby(["city","venue", "court"])["amount_paid"].sum().reset_index().sort_values("amount_paid", ascending=False)
+        st.dataframe(turf_data, height=400)
 
     # --- RECONCILIATION ---
     with tabs[1]:
         st.header("✅ Reconciliation")
-        r_turf = st.selectbox("Turf", ["All Turfs"] + TURFS, key="rec_turf")
+        rec_city = st.selectbox("City", ["All Cities"] + list(VENUES_BY_CITY.keys()), key="rec_city")
+        if rec_city != "All Cities":
+            rec_venue = st.selectbox("Venue", ["All Venues"] + list(VENUES_BY_CITY.get(rec_city, {}).keys()), key="rec_venue")
+            if rec_venue != "All Venues":
+                rec_court = st.selectbox("Court", ["All Courts"] + VENUES_BY_CITY.get(rec_city, {}).get(rec_venue, []), key="rec_court")
+            else:
+                rec_court = st.selectbox("Court", ["All Courts"], key="rec_court")
+        else:
+            rec_venue = st.selectbox("Venue", ["All Venues"], key="rec_venue")
+            rec_court = st.selectbox("Court", ["All Courts"], key="rec_court")
+
         r_platform = st.selectbox("Platform", ["All Platforms"] + PLATFORMS, key="rec_platform")
         r_status = st.selectbox("Status", ["All Statuses"] + STATUSES, key="rec_status")
         r_from = st.date_input("From", value=date.today().replace(day=1), key="rec_from")
         r_to = st.date_input("To", value=date.today(), key="rec_to")
 
-        dfr = load_data()
+        dfr = st.session_state.df.copy()
         dfr["date_only"] = pd.to_datetime(dfr["date"], errors="coerce").dt.date
         dfr = dfr[(dfr["date_only"] >= r_from) & (dfr["date_only"] <= r_to)]
-        if r_turf != "All Turfs":
-            dfr = dfr[dfr["turf_name"] == r_turf]
+        if rec_city != "All Cities":
+            dfr = dfr[dfr["city"] == rec_city]
+        if rec_venue != "All Venues":
+            dfr = dfr[dfr["venue"] == rec_venue]
+        if rec_court != "All Courts":
+            dfr = dfr[dfr["court"] == rec_court]
         if r_platform != "All Platforms":
             dfr = dfr[dfr["platform"] == r_platform]
         if r_status != "All Statuses":
@@ -486,8 +699,8 @@ else:
                         df_all = load_data()
                         df_all.loc[df_all["booking_id"].isin(selected_ids), ["status", "created_by"]] = ["Paid", "Finance"]
                         save_data(df_all)
+                        st.session_state.df = load_data()
                         st.success(f"✅ {len(selected_ids)} booking(s) marked as Paid.")
-                        st.experimental_rerun()
                     else:
                         st.warning("⚠️ No bookings selected.")
             with c2:
@@ -496,26 +709,39 @@ else:
                         df_all = load_data()
                         df_all.loc[df_all["booking_id"].isin(selected_ids), ["status", "created_by"]] = ["Received in Bank", "Finance"]
                         save_data(df_all)
+                        st.session_state.df = load_data()
                         st.success(f"✅ {len(selected_ids)} booking(s) marked as Received in Bank.")
-                        st.experimental_rerun()
                     else:
                         st.warning("⚠️ No bookings selected.")
 
     # --- FINANCE REPORTS ---
     with tabs[2]:
         st.header("📑 Finance Reports — Latest Finance Entries")
-        rep_turf = st.selectbox("Turf", ["All Turfs"] + TURFS, key="rep_turf")
+        rep_city = st.selectbox("City", ["All Cities"] + list(VENUES_BY_CITY.keys()), key="rep_city")
+        if rep_city != "All Cities":
+            rep_venue = st.selectbox("Venue", ["All Venues"] + list(VENUES_BY_CITY.get(rep_city, {}).keys()), key="rep_venue")
+            if rep_venue != "All Venues":
+                rep_court = st.selectbox("Court", ["All Courts"] + VENUES_BY_CITY.get(rep_city, {}).get(rep_venue, []), key="rep_court")
+            else:
+                rep_court = st.selectbox("Court", ["All Courts"], key="rep_court")
+        else:
+            rep_venue = st.selectbox("Venue", ["All Venues"], key="rep_venue")
+            rep_court = st.selectbox("Court", ["All Courts"], key="rep_court")
+
         rep_platform = st.selectbox("Platform", ["All Platforms"] + PLATFORMS, key="rep_platform")
         rep_status = st.selectbox("Payment Status", ["All Statuses", "Pending Only", "Paid Only", "Received in Bank Only"], key="rep_status")
         rep_from = st.date_input("From", value=date.today().replace(day=1), key="rep_from")
         rep_to = st.date_input("To", value=date.today(), key="rep_to")
 
-        rep_df = load_data()
-        rep_df = rep_df[rep_df["created_by"] == "Finance"]
+        rep_df = st.session_state.df.copy()
         rep_df["date_only"] = pd.to_datetime(rep_df["date"], errors="coerce").dt.date
         rep_df = rep_df[(rep_df["date_only"] >= rep_from) & (rep_df["date_only"] <= rep_to)]
-        if rep_turf != "All Turfs":
-            rep_df = rep_df[rep_df["turf_name"] == rep_turf]
+        if rep_city != "All Cities":
+            rep_df = rep_df[rep_df["city"] == rep_city]
+        if rep_venue != "All Venues":
+            rep_df = rep_df[rep_df["venue"] == rep_venue]
+        if rep_court != "All Courts":
+            rep_df = rep_df[rep_df["court"] == rep_court]
         if rep_platform != "All Platforms":
             rep_df = rep_df[rep_df["platform"] == rep_platform]
         if rep_status == "Pending Only":
@@ -546,13 +772,13 @@ else:
     # --- DATA BACKUP ---
     with tabs[3]:
         st.header("🗄️ Data Backup")
-        df_all = load_data()
+        df_all = st.session_state.df
         st.write(f"Total bookings in system: {len(df_all)}")
         st.dataframe(df_all.tail(20))
         all_csv = df_all.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download Full CSV Backup", data=all_csv, file_name="bookings_backup.csv", mime="text/csv", key="backup_csv")
         excel_bytes = to_excel_bytes(df_all)
-        st.download_button("⬇️ Download Full Excel Backup", data=excel_bytes, file_name="bookings_backup.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="backup_excel")
+        st.download_button("⬇️ Download Full Excel", data=excel_bytes, file_name="bookings_backup.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="backup_excel")
 
 st.markdown("---")
-st.caption("Built for SportVot Play — Phase 2.7 (Slots multi-select, advances, timeline, edit/delete) — slot labels updated")
+st.caption("Built for SportVot Play — Form-level selectors (Booking Entry) + Finance cascading selectors; booking entry simplified")
