@@ -881,4 +881,3 @@ if role == "admin":
 
 st.markdown("---")
 st.caption("SportVot Play — Updated: advance_payment_method, fin_sel_recon fix (fin_clear_flag), finance totals/outstanding. For production: replace demo auth and SQLite with managed services.")
-
