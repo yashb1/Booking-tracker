@@ -1,5 +1,4 @@
-# play.py — updated: booking form removes is_advance & status; finance tab has cascading selectors;
-# shows persistent success message after add booking (via st.session_state.last_booking).
+# play.py — Updated: exact venue/court list, safe Excel fallback, success message shown BELOW booking form.
 import streamlit as st
 import pandas as pd
 import os
@@ -7,6 +6,7 @@ import time
 from datetime import datetime, date, time as dtime, timedelta
 import altair as alt
 from io import BytesIO
+import importlib
 
 # =====================================================
 # CONFIG
@@ -15,7 +15,7 @@ CSV_PATH = "bookings.csv"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # =====================================================
-# VENUES / COURTS (structured per your list)
+# VENUES / COURTS (exact list provided)
 # =====================================================
 VENUES_BY_CITY = {
     "Mumbai": {
@@ -118,10 +118,21 @@ def generate_booking_id(df):
     return f"BK{(max_n + 1):04d}"
 
 def to_excel_bytes(df):
+    """
+    Return tuple (bytes, type) where type is "excel" if excel bytes produced, else "csv".
+    Uses openpyxl if available; otherwise falls back to CSV bytes.
+    """
     buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Report")
-    return buffer.getvalue()
+    if importlib.util.find_spec("openpyxl") is not None:
+        try:
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Report")
+            buffer.seek(0)
+            return buffer.getvalue(), "excel"
+        except Exception:
+            pass
+    # fallback CSV
+    return df.to_csv(index=False).encode("utf-8"), "csv"
 
 # slot utilities
 def generate_time_slots(start=dtime(6,0), end=dtime(23,30), step_minutes=30):
@@ -245,13 +256,6 @@ if department == "Operations":
             st.session_state.form_court = default_court
             del st.session_state["should_clear_form"]
 
-        # If there's a last booking (created in prior run), show the persistent success message and then clear it
-        if "last_booking" in st.session_state:
-            lb = st.session_state.pop("last_booking")
-            # lb is dict with key details; show a friendly formatted success box
-            st.success(f"✅ Booking {lb.get('booking_id')} added for {lb.get('city')} | {lb.get('venue')} | {lb.get('court')} — "
-                       f"{lb.get('time_range')} — ₹{int(lb.get('amount',0)):,} (Paid: ₹{int(lb.get('amount_paid',0)):,})")
-
         all_slots = generate_time_slots()  # 30-min slots
 
         # initialize defaults for widget-backed keys if missing
@@ -269,8 +273,6 @@ if department == "Operations":
             st.session_state.entry_platform = PLATFORMS[0]
         if "entry_payment" not in st.session_state:
             st.session_state.entry_payment = PAYMENT_METHODS[0]
-
-        # defaults for form-level selectors already in session_state
 
         # Booking form — includes form-level City/Venue/Court selectors
         with st.form("booking_form", clear_on_submit=False):
@@ -448,6 +450,12 @@ if department == "Operations":
                         # mark to clear on next run
                         st.session_state.should_clear_form = True
                         safe_rerun()
+
+        # ===== Show success message BELOW the form (if present) =====
+        if "last_booking" in st.session_state:
+            lb = st.session_state.pop("last_booking")
+            st.success(f"✅ Booking {lb.get('booking_id')} added for {lb.get('city')} | {lb.get('venue')} | {lb.get('court')} — "
+                       f"{lb.get('time_range')} — ₹{int(lb.get('amount',0)):,} (Paid: ₹{int(lb.get('amount_paid',0)):,})")
 
     # --- OPS REPORTS ---
     with tabs[2]:
@@ -761,11 +769,14 @@ else:
             col3.metric("Received (bank)", f"{rep_df[rep_df['status'] == 'Received in Bank']['amount_paid'].sum():,.0f} ₹")
 
             st.dataframe(rep_df, height=450)
-            csv_bytes = rep_df.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="finance_latest.csv", mime="text/csv", key="rep_csv")
-            excel_bytes = to_excel_bytes(rep_df)
-            st.download_button("⬇️ Download Full Excel", data=excel_bytes, file_name="finance_latest.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_excel")
+
+            # Excel/CSV fallback using to_excel_bytes
+            excel_bytes, btype = to_excel_bytes(rep_df)
+            if btype == "excel":
+                st.download_button("⬇️ Download Full Excel", data=excel_bytes, file_name="finance_latest.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rep_excel")
+            else:
+                st.download_button("⬇️ Download CSV", data=excel_bytes, file_name="finance_latest.csv", mime="text/csv", key="rep_csv")
         else:
             st.info("No reconciliation entries found for Finance team.")
 
@@ -777,8 +788,11 @@ else:
         st.dataframe(df_all.tail(20))
         all_csv = df_all.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download Full CSV Backup", data=all_csv, file_name="bookings_backup.csv", mime="text/csv", key="backup_csv")
-        excel_bytes = to_excel_bytes(df_all)
-        st.download_button("⬇️ Download Full Excel", data=excel_bytes, file_name="bookings_backup.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="backup_excel")
+        excel_bytes, btype = to_excel_bytes(df_all)
+        if btype == "excel":
+            st.download_button("⬇️ Download Full Excel", data=excel_bytes, file_name="bookings_backup.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="backup_excel")
+        else:
+            st.download_button("⬇️ Download Full CSV (fallback)", data=excel_bytes, file_name="bookings_backup.csv", mime="text/csv", key="backup_csv2")
 
 st.markdown("---")
-st.caption("Built for SportVot Play — Form-level selectors (Booking Entry) + Finance cascading selectors; booking entry simplified")
+st.caption("Built for SportVot Play — Venue list updated; Excel fallback; booking success message shown below the form")
