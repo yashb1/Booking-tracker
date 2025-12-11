@@ -1,5 +1,5 @@
 # play.py
-# SportVot Play — Corrected: fixed city->venue reset, advance payment method, fin_sel_recon safe clearing
+# SportVot Play — Final consolidated version (Option B: advance method saved only when amount_paid > 0)
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -42,7 +42,7 @@ VENUES_BY_CITY = {
 
 PLATFORMS = ["Huddle", "KheloMore", "SportVot Direct", "Event Company", "Turf Owner (Direct)"]
 PAYMENT_METHODS = ["Cash", "SV Paytm", "Huddle Payout", "KheloMore Payout", "Bank Transfer"]
-ADVANCE_METHODS = ["Cash", "GPay", "PhonePe", "Bank Transfer", "Cheque", "Other"]
+ADVANCE_METHODS = ["Cash", "UPI", "Cheque", "Bank Transfer"]
 STATUSES = ["Pending", "Paid", "Received in Bank"]
 
 # ------------------------
@@ -398,20 +398,18 @@ if role in ("operations","admin"):
         st.session_state.setdefault("entry_advance_method", ADVANCE_METHODS[0])
 
         with st.form("booking_form", clear_on_submit=False):
-            # ---------- SAFE City -> Venue -> Court (resets when city changes) ----------
-            # Create city selectbox (writes to st.session_state["form_city"])
+            # ---------- FIXED City -> Venue -> Court handling ----------
+            # Create city selectbox (widget writes into session_state["form_city"])
             st.selectbox(
                 "Select City",
                 list(VENUES_BY_CITY.keys()),
                 index=list(VENUES_BY_CITY.keys()).index(st.session_state["form_city"]),
                 key="form_city"
             )
-            # Immediately read current city from session_state
             current_city = st.session_state["form_city"]
 
-            # If the city changed since last run, reset venue & court BEFORE creating those widgets
+            # If the city changed since last run, reset venue & court BEFORE creating their widgets
             if current_city != st.session_state.get("prev_city"):
-                # set new defaults for venue & court safely (before their widgets)
                 venues_for_city = list(VENUES_BY_CITY.get(current_city, {}).keys())
                 if venues_for_city:
                     st.session_state["form_venue"] = venues_for_city[0]
@@ -469,10 +467,10 @@ if role in ("operations","admin"):
             for slot in all_slots:
                 sdt = slots_to_dt(slot, b_date)
                 edt = sdt + timedelta(minutes=30)
-                conflict=False
+                conflict = False
                 for br in booked_ranges:
                     if ranges_overlap(sdt, edt, br[0], br[1]):
-                        conflict=True; break
+                        conflict = True; break
                 if not conflict:
                     available_slots.append(slot)
 
@@ -502,19 +500,13 @@ if role in ("operations","admin"):
             else:
                 payment_method = st.selectbox("Payment Method", PAYMENT_METHODS, index=0, key="entry_payment")
 
+            # Advance amount is persistent (always visible)
             amount = st.number_input("Booking Amount (INR)", min_value=0, step=100, value=st.session_state["entry_amount"], key="entry_amount")
-            amount_paid = st.number_input("Amount Paid Now (INR)", min_value=0.0, step=100.0, value=st.session_state["entry_amount_paid"], key="entry_amount_paid")
+            amount_paid = st.number_input("Advance Amount Received (INR)", min_value=0.0, step=50.0, value=st.session_state["entry_amount_paid"], key="entry_amount_paid")
 
-            # Show advance payment method selector only when some amount is paid now (>0)
-            if float(amount_paid) > 0:
-                # ensure default exists before creating widget
-                st.session_state.setdefault("entry_advance_method", ADVANCE_METHODS[0])
-                if st.session_state.get("entry_advance_method") not in ADVANCE_METHODS:
-                    st.session_state["entry_advance_method"] = ADVANCE_METHODS[0]
-                st.selectbox("Advance payment received via", ADVANCE_METHODS, index=ADVANCE_METHODS.index(st.session_state["entry_advance_method"]), key="entry_advance_method")
-                advance_method = st.session_state["entry_advance_method"]
-            else:
-                advance_method = st.session_state.get("entry_advance_method", "")
+            # Advance method is always shown in UI, but per Option B we will save it only when amount_paid > 0
+            st.selectbox("Advance payment received via", ADVANCE_METHODS, index=ADVANCE_METHODS.index(st.session_state["entry_advance_method"]) if st.session_state.get("entry_advance_method") in ADVANCE_METHODS else 0, key="entry_advance_method")
+            advance_method_ui = st.session_state.get("entry_advance_method", ADVANCE_METHODS[0])
 
             remarks = st.text_input("Remarks (optional)", value=st.session_state["entry_remarks"], key="entry_remarks", max_chars=200)
             submitted = st.form_submit_button("➕ Add Booking")
@@ -536,7 +528,7 @@ if role in ("operations","admin"):
                     chosen_start = slots_to_dt(sorted_slots[0], b_date)
                     chosen_end = slots_to_dt(sorted_slots[-1], b_date) + timedelta(minutes=30)
                     # final overlap check
-                    conflict=False
+                    conflict = False
                     cur = conn.cursor()
                     cur.execute("SELECT date, end_time FROM bookings WHERE city=? AND venue=? AND court=? AND date(date)=?", (current_city, form_venue, form_court, b_date.strftime("%Y-%m-%d")))
                     existing = cur.fetchall()
@@ -544,13 +536,15 @@ if role in ("operations","admin"):
                         s_dt = pd.to_datetime(ex[0])
                         e_dt = pd.to_datetime(ex[1])
                         if ranges_overlap(chosen_start, chosen_end, s_dt, e_dt):
-                            conflict=True; break
+                            conflict = True; break
                     if conflict:
                         st.error("Selected slot conflicts with existing booking.")
                     else:
                         new_id = get_next_booking_id(conn)
                         created_on = datetime.now().strftime(DATE_FORMAT)
                         turf_name = f"{current_city} | {form_venue} | {form_court}"
+                        # Option B: save advance_method only when amount_paid > 0
+                        advance_method_to_save = advance_method_ui if float(amount_paid) > 0 else ""
                         new_row = {
                             "booking_id": new_id,
                             "created_on": created_on,
@@ -572,7 +566,7 @@ if role in ("operations","admin"):
                             "reconciled": 1 if float(amount_paid) >= float(amount) and amount > 0 else 0,
                             "bank_ref": "",
                             "reconciled_on": (datetime.now().strftime(DATE_FORMAT) if float(amount_paid) >= float(amount) and amount > 0 else ""),
-                            "advance_method": advance_method if float(amount_paid) > 0 else ""
+                            "advance_method": advance_method_to_save
                         }
                         add_booking_db(conn, new_row)
                         st.session_state.df = load_bookings_df(conn)
@@ -668,7 +662,7 @@ with tabs[reports_tab_index]:
 # ------------------------
 fin_tab_index = 3 if role in ("operations","admin") else 2
 with tabs[fin_tab_index]:
-    st.header("💼 Finance — Payments & Reconciliation")
+    st.header("💼 Finance — Payments Overview")
     f_from = st.date_input("From", value=date.today().replace(day=1), key="fin_from")
     f_to = st.date_input("To", value=date.today(), key="fin_to")
 
@@ -697,70 +691,69 @@ with tabs[fin_tab_index]:
     col5.metric("Reconciled bookings", f"{total_reconciled_count}")
     col6.metric("Reconciled (collected)", f"₹{int(total_reconciled_amount):,}")
 
-    st.markdown("### Unreconciled / Pending Payments")
+    st.markdown("### Outstanding / Pending Payments")
     if not df_f.empty:
-        unreconciled = df_f[(df_f["reconciled"] == 0) | (df_f["amount_paid"] < df_f["amount"])]
-        if unreconciled.empty:
-            st.success("All bookings in range are reconciled or fully paid.")
-        else:
-            st.dataframe(unreconciled[["booking_id","date","booking_name","venue","court","amount","amount_paid","status","reconciled","bank_ref","advance_method"]], height=250)
-
-            if role in ("finance","admin"):
-                st.markdown("#### Manual Reconciliation")
-
-                # Safe clear flag handling BEFORE widget creation
-                if st.session_state.get("fin_clear_flag"):
-                    # ensure widget default is empty
-                    st.session_state["fin_sel_recon"] = []
-                    # clear flag so this runs only once
-                    del st.session_state["fin_clear_flag"]
-
-                # Create multiselect widget (key = "fin_sel_recon")
-                sel = st.multiselect("Select Booking IDs to reconcile", unreconciled["booking_id"].tolist(), key="fin_sel_recon")
-
-                bank_ref = st.text_input("Bank / Reference (enter bank reference)", key="fin_bank_ref")
-                reconcile_date = st.date_input("Reconciled on", value=date.today(), key="fin_recon_date")
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("Mark Selected as Reconciled"):
-                        if not sel:
-                            st.warning("Select at least one booking to reconcile.")
-                        else:
-                            for bid in sel:
-                                update_booking_db(conn, bid, {
-                                    "reconciled": 1,
-                                    "bank_ref": bank_ref,
-                                    "reconciled_on": reconcile_date.strftime("%Y-%m-%d"),
-                                    "status": "Received in Bank"
-                                })
-                            st.success(f"Reconciled {len(sel)} bookings.")
-                            st.session_state.df = load_bookings_df(conn)
-                            st.session_state["fin_clear_flag"] = True
-                            safe_rerun()
-
-                with c2:
-                    if st.button("Mark Selected as Received in Bank"):
-                        if not sel:
-                            st.warning("Select at least one booking.")
-                        else:
-                            for bid in sel:
-                                update_booking_db(conn, bid, {
-                                    "status": "Received in Bank",
-                                    "reconciled": 1,
-                                    "bank_ref": bank_ref,
-                                    "reconciled_on": reconcile_date.strftime("%Y-%m-%d")
-                                })
-                            st.success(f"{len(sel)} bookings marked Received in Bank.")
-                            st.session_state.df = load_bookings_df(conn)
-                            st.session_state["fin_clear_flag"] = True
-                            safe_rerun()
-
+        unreconciled = df_f[(df_f["amount_paid"] < df_f["amount"])]
+        st.dataframe(unreconciled[["booking_id","date","booking_name","venue","court","amount","amount_paid","advance_method","status"]], height=300)
     else:
-        st.info("No bookings in the selected finance range.")
+        st.info("No bookings in selected range.")
+
+    # OPS should not see reconciliation/upload/ledger — stop here for ops
+    if role not in ("finance","admin"):
+        st.warning("⚠ Finance-only actions are hidden. Contact Finance / Admin.")
+        st.stop()
+
+    # ------------------------
+    # Finance-only: Manual Reconciliation & Upload & Ledger
+    # ------------------------
+    st.markdown("### 🔧 Manual Reconciliation")
+    # safe clearing flag before widget instantiation
+    if st.session_state.get("fin_clear_flag"):
+        st.session_state["fin_sel_recon"] = []
+        del st.session_state["fin_clear_flag"]
+
+    # create multiselect
+    sel = st.multiselect("Select Booking IDs to reconcile", df_f[(df_f["reconciled"]==0) | (df_f["amount_paid"] < df_f["amount"]) ]["booking_id"].tolist(), key="fin_sel_recon")
+    bank_ref = st.text_input("Bank / Reference (enter bank reference)", key="fin_bank_ref")
+    reconcile_date = st.date_input("Reconciled on", value=date.today(), key="fin_recon_date")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Mark Selected as Reconciled"):
+            if not sel:
+                st.warning("Select at least one booking to reconcile.")
+            else:
+                for bid in sel:
+                    update_booking_db(conn, bid, {
+                        "reconciled": 1,
+                        "bank_ref": bank_ref,
+                        "reconciled_on": reconcile_date.strftime("%Y-%m-%d"),
+                        "status": "Received in Bank"
+                    })
+                st.success(f"Reconciled {len(sel)} bookings.")
+                st.session_state.df = load_bookings_df(conn)
+                st.session_state["fin_clear_flag"] = True
+                safe_rerun()
+
+    with c2:
+        if st.button("Mark Selected as Received in Bank"):
+            if not sel:
+                st.warning("Select at least one booking.")
+            else:
+                for bid in sel:
+                    update_booking_db(conn, bid, {
+                        "status": "Received in Bank",
+                        "reconciled": 1,
+                        "bank_ref": bank_ref,
+                        "reconciled_on": reconcile_date.strftime("%Y-%m-%d")
+                    })
+                st.success(f"{len(sel)} bookings marked Received in Bank.")
+                st.session_state.df = load_bookings_df(conn)
+                st.session_state["fin_clear_flag"] = True
+                safe_rerun()
 
     st.markdown("---")
-    st.markdown("### Upload bank statement / reconciliation file (CSV)")
+    st.markdown("### 📤 Upload bank statement / reconciliation file (CSV)")
     st.write("CSV should have columns: booking_id (optional), amount, bank_ref, date")
     uploaded = st.file_uploader("Upload bank CSV (auto-match by booking_id or amount)", type=["csv"], key="fin_upload")
     if uploaded is not None:
@@ -800,20 +793,17 @@ with tabs[fin_tab_index]:
             st.error(f"Upload failed: {e}")
 
     st.markdown("---")
-    st.markdown("### Reconciliation ledger (reconciled bookings)")
-    if not df_f.empty and "reconciled" in df_f.columns:
-        ledger = df_f[df_f["reconciled"] == 1].sort_values("reconciled_on", ascending=False)
-        if ledger.empty:
-            st.info("No reconciled bookings in range.")
-        else:
-            st.dataframe(ledger[["booking_id","reconciled_on","bank_ref","date","booking_name","venue","court","amount","amount_paid","status","advance_method"]], height=300)
-            excel_bytes, btype = to_excel_bytes(ledger)
-            if btype == "excel":
-                st.download_button("⬇️ Download Reconciliation Ledger (Excel)", data=excel_bytes, file_name="reconciliation.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            else:
-                st.download_button("⬇️ Download Reconciliation Ledger (CSV)", data=excel_bytes, file_name="reconciliation.csv", mime="text/csv")
+    st.markdown("### 📘 Reconciliation Ledger (reconciled bookings)")
+    ledger = df_f[df_f["reconciled"] == 1].sort_values("reconciled_on", ascending=False) if not df_f.empty else pd.DataFrame()
+    if ledger.empty:
+        st.info("No reconciled bookings in range.")
     else:
-        st.info("No reconciled data available.")
+        st.dataframe(ledger[["booking_id","reconciled_on","bank_ref","date","booking_name","venue","court","amount","amount_paid","status","advance_method"]], height=300)
+        excel_bytes, btype = to_excel_bytes(ledger)
+        if btype == "excel":
+            st.download_button("⬇️ Download Reconciliation Ledger (Excel)", data=excel_bytes, file_name="reconciliation.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.download_button("⬇️ Download Reconciliation Ledger (CSV)", data=excel_bytes, file_name="reconciliation.csv", mime="text/csv")
 
 # ------------------------
 # Admin tab (admin only)
@@ -888,4 +878,4 @@ if role == "admin":
                 st.error(f"Upload failed: {e}")
 
 st.markdown("---")
-st.caption("SportVot Play — Corrected: city->venue reset, advance payment method stored, fin_sel_recon safe clearing. For production, move auth & DB to managed services.")
+st.caption("SportVot Play — Final (Option B). Advance method saved only when advance > 0. Ops cannot access reconciliation/upload/ledger. For production: replace demo auth and SQLite with managed services.")
