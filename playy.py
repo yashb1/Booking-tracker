@@ -1,8 +1,9 @@
 # playy.py
-# SportVot Play — Final with Canonical Session State Fix (V3)
+# SportVot Play — Final Robust Version (V4)
+# - FIX: Moved City selectbox outside of st.form to resolve StreamlitInvalidFormCallbackError.
 # - FIX: Implemented st.selectbox 'on_change' callback for robust City->Venue reset.
 # - Canonical session keys: form_city, form_venue, form_court maintained.
-# - All features (Login, DB, Booking, Reports, Finance, Admin) preserved.
+# - All original features preserved.
 
 import streamlit as st
 import pandas as pd
@@ -286,7 +287,6 @@ def update_venue_on_city_change():
     else:
         st.session_state["form_venue"] = None
         st.session_state["form_court"] = None
-    # No need to call safe_rerun() here as Streamlit automatically reruns after a widget interaction
 # ---------------------------------------------
 
 # LOGIN / LOGOUT UI
@@ -386,23 +386,24 @@ if role in ("operations","admin"):
     with tabs[1]:
         st.header("✍️ Booking Entry")
 
+        # --- FIX: CITY SELECTION IS OUTSIDE THE FORM TO ALLOW on_change CALLBACK ---
+        cities = list(VENUES_BY_CITY.keys())
+        if st.session_state.get("form_city") not in cities:
+            st.session_state["form_city"] = cities[0]
+
+        st.selectbox(
+            "Select City",
+            cities,
+            index=cities.index(st.session_state["form_city"]),
+            key="form_city",
+            on_change=update_venue_on_city_change # This is the crucial fix now placed correctly
+        )
+        current_city = st.session_state["form_city"]
+        # --------------------------------------------------------------------------
+
         with st.form("booking_form", clear_on_submit=True):
-            # CITY (canonical)
-            cities = list(VENUES_BY_CITY.keys())
-            if st.session_state.get("form_city") not in cities:
-                st.session_state["form_city"] = cities[0]
 
-            # FIX: Use on_change callback to reset dependent fields immediately
-            st.selectbox(
-                "Select City",
-                cities,
-                index=cities.index(st.session_state["form_city"]),
-                key="form_city",
-                on_change=update_venue_on_city_change # <--- THIS IS THE FIX
-            )
-            current_city = st.session_state["form_city"]
-
-            # Compute venues/courts for this city
+            # Compute venues/courts for this city (uses current_city set above)
             venues = list(VENUES_BY_CITY.get(current_city, {}).keys())
             if not venues:
                 st.error("No venues configured for this city.")
@@ -428,7 +429,7 @@ if role in ("operations","admin"):
                     st.selectbox("Select Court / Turf", courts, index=courts.index(st.session_state["form_court"]), key="form_court")
                     form_court = st.session_state["form_court"]
 
-            # Booking details
+            # Booking details (now all inside the form)
             booking_name = st.text_input("Booking Name / Team Name", value=st.session_state.get("entry_booking_name",""), key="entry_booking_name")
             b_date = st.date_input("Booking Date", value=st.session_state.get("entry_date", date.today()), key="entry_date")
 
@@ -885,4 +886,4 @@ if role == "admin":
                 st.error(f"Upload failed: {e}")
 
 st.markdown("---")
-st.caption("SportVot Play — Final. If you still see city/venue mismatch: 1) confirm you're logged in (ops/fin/admin), 2) refresh the app (Ctrl+F5), 3) send a screenshot with your selected City and the Venue list shown. I will patch immediately.")
+st.caption("SportVot Play — Final. If you still see city/venue mismatch: 1) confirm you're logged in (ops/fin/admin), 2) refresh the app (Ctrl+F5), 3) send a screenshot with your selected City and the Venue list shown.")
