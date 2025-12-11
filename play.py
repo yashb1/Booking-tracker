@@ -1,5 +1,9 @@
 # play.py
-# SportVot Play — Final consolidated version (Option B: advance method saved only when amount_paid > 0)
+# SportVot Play — Updated final
+# - Fixed city->venue->court linkage
+# - Booking form clears after submit
+# - Advance method shown always, saved only when amount_paid > 0 (Option B)
+# - Ops cannot access reconciliation/upload/ledger/manual-reconcile
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -114,13 +118,6 @@ def create_schema(conn):
     conn.commit()
 
 def ensure_schema_ext(conn):
-    """
-    Add reconciliation-related columns and advance_method if missing:
-      - reconciled (INTEGER 0/1)
-      - bank_ref (TEXT)
-      - reconciled_on (TEXT)
-      - advance_method (TEXT)
-    """
     cur = conn.cursor()
     cur.execute("PRAGMA table_info(bookings)")
     cols = [r[1] for r in cur.fetchall()]
@@ -284,15 +281,20 @@ def login_form():
             st.session_state.user = user
             st.session_state.role = store[user]["role"]
             st.sidebar.success(f"Signed in as {user} ({st.session_state.role})")
-            # init form selectors on first login (set defaults BEFORE widgets render)
-            if "form_city" not in st.session_state:
-                st.session_state.form_city = list(VENUES_BY_CITY.keys())[0]
-            if "form_venue" not in st.session_state:
-                st.session_state.form_venue = list(VENUES_BY_CITY[st.session_state.form_city].keys())[0]
-            if "form_court" not in st.session_state:
-                st.session_state.form_court = VENUES_BY_CITY[st.session_state.form_city][st.session_state.form_venue][0]
-            if "prev_city" not in st.session_state:
-                st.session_state.prev_city = st.session_state.form_city
+            # initialize safe defaults BEFORE widgets render
+            st.session_state.setdefault("form_city_select", list(VENUES_BY_CITY.keys())[0])
+            first_city = st.session_state["form_city_select"]
+            st.session_state.setdefault("form_venue_select", list(VENUES_BY_CITY[first_city].keys())[0])
+            st.session_state.setdefault("form_court_select", VENUES_BY_CITY[first_city][st.session_state["form_venue_select"]][0])
+            st.session_state.setdefault("prev_city", st.session_state["form_city_select"])
+            # initialize booking defaults
+            st.session_state.setdefault("entry_selected_slots", [])
+            st.session_state.setdefault("entry_booking_name", "")
+            st.session_state.setdefault("entry_amount", 1400)
+            st.session_state.setdefault("entry_amount_paid", 0.0)
+            st.session_state.setdefault("entry_remarks", "")
+            st.session_state.setdefault("entry_platform", PLATFORMS[0])
+            st.session_state.setdefault("entry_advance_method", ADVANCE_METHODS[0])
             safe_rerun()
         else:
             st.sidebar.error("Invalid username or password")
@@ -321,7 +323,7 @@ conn = st.session_state.conn
 role = st.session_state.role
 user = st.session_state.user
 
-# Today's summary - simplified (no Venue/Court breakdown)
+# Today's summary
 st.markdown("## Today's Summary")
 today = date.today()
 cur = conn.cursor()
@@ -365,88 +367,58 @@ with tabs[0]:
 if role in ("operations","admin"):
     with tabs[1]:
         st.header("✍️ Booking Entry")
-        all_slots = generate_time_slots()
 
-        # Initialize defaults & clear flags BEFORE widgets render
-        if "form_city" not in st.session_state:
-            st.session_state.form_city = list(VENUES_BY_CITY.keys())[0]
-        if "form_venue" not in st.session_state:
-            st.session_state.form_venue = list(VENUES_BY_CITY[st.session_state.form_city].keys())[0]
-        if "form_court" not in st.session_state:
-            st.session_state.form_court = VENUES_BY_CITY[st.session_state.form_city][st.session_state.form_venue][0]
-        if "prev_city" not in st.session_state:
-            st.session_state.prev_city = st.session_state.form_city
-
-        # Clear-on-submit handling: reset entry fields BEFORE rendering widgets if flag present
-        if st.session_state.get("should_clear_form"):
-            st.session_state.entry_selected_slots = []
-            st.session_state.entry_booking_name = ""
-            st.session_state.entry_amount = 1400
-            st.session_state.entry_amount_paid = 0.0
-            st.session_state.entry_remarks = ""
-            st.session_state.entry_platform = PLATFORMS[0]
-            st.session_state.entry_advance_method = ADVANCE_METHODS[0]
-            del st.session_state["should_clear_form"]
-
-        # ensure entry defaults exist
-        st.session_state.setdefault("entry_selected_slots", [])
-        st.session_state.setdefault("entry_booking_name", "")
-        st.session_state.setdefault("entry_amount", 1400)
-        st.session_state.setdefault("entry_amount_paid", 0.0)
-        st.session_state.setdefault("entry_remarks", "")
-        st.session_state.setdefault("entry_platform", PLATFORMS[0])
-        st.session_state.setdefault("entry_advance_method", ADVANCE_METHODS[0])
-
-        with st.form("booking_form", clear_on_submit=False):
-            # ---------- FIXED City -> Venue -> Court handling ----------
-            # Create city selectbox (widget writes into session_state["form_city"])
+        # Booking form block (fixed city->venue->court + form reset)
+        # IMPORTANT: use clear_on_submit=True so widgets clear; also reset session_state keys BEFORE rerun
+        with st.form("booking_form", clear_on_submit=True):
+            # CITY (writes into session_state["form_city_select"])
             st.selectbox(
                 "Select City",
                 list(VENUES_BY_CITY.keys()),
-                index=list(VENUES_BY_CITY.keys()).index(st.session_state["form_city"]),
-                key="form_city"
+                index=list(VENUES_BY_CITY.keys()).index(st.session_state.get("form_city_select", list(VENUES_BY_CITY.keys())[0])),
+                key="form_city_select"
             )
-            current_city = st.session_state["form_city"]
+            current_city = st.session_state["form_city_select"]
 
-            # If the city changed since last run, reset venue & court BEFORE creating their widgets
-            if current_city != st.session_state.get("prev_city"):
+            # If city changed since previous run, reset the venue/court defaults BEFORE creating those widgets
+            if st.session_state.get("prev_city") != current_city:
                 venues_for_city = list(VENUES_BY_CITY.get(current_city, {}).keys())
                 if venues_for_city:
-                    st.session_state["form_venue"] = venues_for_city[0]
-                    courts_for_venue = VENUES_BY_CITY.get(current_city, {}).get(st.session_state["form_venue"], [])
-                    st.session_state["form_court"] = courts_for_venue[0] if courts_for_venue else None
+                    st.session_state["form_venue_select"] = venues_for_city[0]
+                    courts_for_venue = VENUES_BY_CITY.get(current_city, {}).get(st.session_state["form_venue_select"], [])
+                    st.session_state["form_court_select"] = courts_for_venue[0] if courts_for_venue else None
                 else:
-                    st.session_state["form_venue"] = None
-                    st.session_state["form_court"] = None
+                    st.session_state["form_venue_select"] = None
+                    st.session_state["form_court_select"] = None
                 st.session_state["prev_city"] = current_city
 
-            # Now create Venue selectbox using valid defaults for the selected city
-            _all_venues = list(VENUES_BY_CITY.get(current_city, {}).keys())
-            if not _all_venues:
+            # Venue selectbox (safe)
+            _venues = list(VENUES_BY_CITY.get(current_city, {}).keys())
+            if not _venues:
                 st.error("No venues configured for this city.")
                 form_venue = None
             else:
-                if st.session_state.get("form_venue") not in _all_venues:
-                    st.session_state["form_venue"] = _all_venues[0]
-                st.selectbox("Select Venue", _all_venues, index=_all_venues.index(st.session_state["form_venue"]), key="form_venue")
-                form_venue = st.session_state["form_venue"]
+                if st.session_state.get("form_venue_select") not in _venues:
+                    st.session_state["form_venue_select"] = _venues[0]
+                st.selectbox("Select Venue", _venues, index=_venues.index(st.session_state["form_venue_select"]), key="form_venue_select")
+                form_venue = st.session_state["form_venue_select"]
 
-            # Create courts for selected venue
-            _all_courts = VENUES_BY_CITY.get(current_city, {}).get(form_venue, []) if form_venue else []
-            if not _all_courts:
+            # Court selectbox (safe)
+            _courts = VENUES_BY_CITY.get(current_city, {}).get(form_venue, []) if form_venue else []
+            if not _courts:
                 st.warning("No courts/turfs configured for this venue.")
                 form_court = None
             else:
-                if st.session_state.get("form_court") not in _all_courts:
-                    st.session_state["form_court"] = _all_courts[0]
-                st.selectbox("Select Court / Turf", _all_courts, index=_all_courts.index(st.session_state["form_court"]), key="form_court")
-                form_court = st.session_state["form_court"]
-            # -------------------------------------------------------------------------
+                if st.session_state.get("form_court_select") not in _courts:
+                    st.session_state["form_court_select"] = _courts[0]
+                st.selectbox("Select Court / Turf", _courts, index=_courts.index(st.session_state["form_court_select"]), key="form_court_select")
+                form_court = st.session_state["form_court_select"]
 
-            booking_name = st.text_input("Booking Name / Team Name", value=st.session_state["entry_booking_name"], key="entry_booking_name")
-            b_date = st.date_input("Booking Date", value=date.today(), key="entry_date")
+            # Booking fields
+            booking_name = st.text_input("Booking Name / Team Name", value=st.session_state.get("entry_booking_name",""), key="entry_booking_name")
+            b_date = st.date_input("Booking Date", value=st.session_state.get("entry_date", date.today()), key="entry_date")
 
-            # Determine booked ranges for selected court & date
+            # compute available slots
             df_now = load_bookings_df(conn)
             if not df_now.empty:
                 df_now["date_only"] = pd.to_datetime(df_now["date"], errors="coerce").dt.date
@@ -463,6 +435,7 @@ if role in ("operations","admin"):
                 if pd.notnull(s) and pd.notnull(e):
                     booked_ranges.append((pd.to_datetime(s), pd.to_datetime(e)))
 
+            all_slots = generate_time_slots()
             available_slots = []
             for slot in all_slots:
                 sdt = slots_to_dt(slot, b_date)
@@ -470,7 +443,8 @@ if role in ("operations","admin"):
                 conflict = False
                 for br in booked_ranges:
                     if ranges_overlap(sdt, edt, br[0], br[1]):
-                        conflict = True; break
+                        conflict = True
+                        break
                 if not conflict:
                     available_slots.append(slot)
 
@@ -478,8 +452,8 @@ if role in ("operations","admin"):
                 st.warning("No available time slots for this court & date. Choose another date/court.")
 
             slot_labels = [format_slot_range(s) for s in available_slots]
-            selected_slot_labels = st.multiselect("Select contiguous half-hour slots (multi-select)", slot_labels, default=st.session_state.get("entry_selected_slots", []), key="entry_selected_slots") if available_slots else []
-            selected_slots=[]
+            selected_slot_labels = st.multiselect("Select contiguous half-hour slots (multi-select)", slot_labels, default=[], key="entry_selected_slots") if available_slots else []
+            selected_slots = []
             for lbl in selected_slot_labels:
                 try:
                     start_str = lbl.split("-")[0].strip()
@@ -490,7 +464,7 @@ if role in ("operations","admin"):
             if selected_slot_labels and not selected_slots_contiguous(selected_slots):
                 st.error("Selected slots must be contiguous (adjacent half-hour slots).")
 
-            platform = st.selectbox("Platform", PLATFORMS, index=PLATFORMS.index(st.session_state["entry_platform"]), key="entry_platform")
+            platform = st.selectbox("Platform", PLATFORMS, index=PLATFORMS.index(st.session_state.get("entry_platform", PLATFORMS[0])), key="entry_platform")
             if platform == "Huddle":
                 payment_method = "Huddle Payout"
             elif platform == "KheloMore":
@@ -500,15 +474,14 @@ if role in ("operations","admin"):
             else:
                 payment_method = st.selectbox("Payment Method", PAYMENT_METHODS, index=0, key="entry_payment")
 
-            # Advance amount is persistent (always visible)
-            amount = st.number_input("Booking Amount (INR)", min_value=0, step=100, value=st.session_state["entry_amount"], key="entry_amount")
-            amount_paid = st.number_input("Advance Amount Received (INR)", min_value=0.0, step=50.0, value=st.session_state["entry_amount_paid"], key="entry_amount_paid")
+            # Advance amount persistent + advance method UI persistent.
+            amount = st.number_input("Booking Amount (INR)", min_value=0, step=100, value=st.session_state.get("entry_amount", 1400), key="entry_amount")
+            amount_paid = st.number_input("Advance Amount Received (INR)", min_value=0.0, step=50.0, value=st.session_state.get("entry_amount_paid", 0.0), key="entry_amount_paid")
+            st.selectbox("Advance payment received via", ADVANCE_METHODS, index=ADVANCE_METHODS.index(st.session_state.get("entry_advance_method", ADVANCE_METHODS[0])), key="entry_advance_method")
+            advance_method_ui = st.session_state.get("entry_advance_method", "")
 
-            # Advance method is always shown in UI, but per Option B we will save it only when amount_paid > 0
-            st.selectbox("Advance payment received via", ADVANCE_METHODS, index=ADVANCE_METHODS.index(st.session_state["entry_advance_method"]) if st.session_state.get("entry_advance_method") in ADVANCE_METHODS else 0, key="entry_advance_method")
-            advance_method_ui = st.session_state.get("entry_advance_method", ADVANCE_METHODS[0])
+            remarks = st.text_input("Remarks (optional)", value=st.session_state.get("entry_remarks",""), key="entry_remarks", max_chars=200)
 
-            remarks = st.text_input("Remarks (optional)", value=st.session_state["entry_remarks"], key="entry_remarks", max_chars=200)
             submitted = st.form_submit_button("➕ Add Booking")
 
             if submitted:
@@ -537,6 +510,7 @@ if role in ("operations","admin"):
                         e_dt = pd.to_datetime(ex[1])
                         if ranges_overlap(chosen_start, chosen_end, s_dt, e_dt):
                             conflict = True; break
+
                     if conflict:
                         st.error("Selected slot conflicts with existing booking.")
                     else:
@@ -569,17 +543,32 @@ if role in ("operations","admin"):
                             "advance_method": advance_method_to_save
                         }
                         add_booking_db(conn, new_row)
-                        st.session_state.df = load_bookings_df(conn)
-                        st.session_state.last_booking = {
+
+                        # Reset the form-related session_state so the form is clean for the next entry.
+                        # These are keys used by widgets - set them BEFORE rerun.
+                        st.session_state["entry_selected_slots"] = []
+                        st.session_state["entry_booking_name"] = ""
+                        st.session_state["entry_amount"] = 1400
+                        st.session_state["entry_amount_paid"] = 0.0
+                        st.session_state["entry_remarks"] = ""
+                        st.session_state["entry_platform"] = PLATFORMS[0]
+                        st.session_state["entry_advance_method"] = ADVANCE_METHODS[0]
+                        # keep city same but ensure venue/court defaults are valid
+                        st.session_state.setdefault("form_city_select", current_city)
+                        venues = list(VENUES_BY_CITY.get(current_city, {}).keys())
+                        if venues:
+                            st.session_state["form_venue_select"] = venues[0]
+                            st.session_state["form_court_select"] = VENUES_BY_CITY[current_city][venues[0]][0]
+                        # store last booking to show success AFTER rerun
+                        st.session_state["last_booking"] = {
                             "booking_id": new_id,
                             "city": current_city, "venue": form_venue, "court": form_court,
                             "time_range": f"{format_slot_range(sorted_slots[0], (len(sorted_slots)*30))}",
                             "amount": int(amount), "amount_paid": int(amount_paid)
                         }
-                        st.session_state.should_clear_form = True
                         safe_rerun()
 
-        # show success below the form if present
+        # show success below the form (after rerun)
         if "last_booking" in st.session_state:
             lb = st.session_state.pop("last_booking")
             st.success(f"✅ Booking {lb['booking_id']} added for {lb['city']} | {lb['venue']} | {lb['court']} — {lb['time_range']} — ₹{lb['amount']:,} (Paid: ₹{lb['amount_paid']:,})")
@@ -620,12 +609,12 @@ with tabs[reports_tab_index]:
     st.write(f"Rows: {len(df_rep)}")
     st.dataframe(df_rep, height=350)
 
-    # Timeline for selected court & date
+    # Timeline
     st.markdown("### 🕒 Visual Timeline")
     t_date = st.date_input("Timeline Date", value=date.today(), key="timeline_date")
-    sel_city = st.session_state.get("form_city", list(VENUES_BY_CITY.keys())[0])
-    sel_venue = st.session_state.get("form_venue", list(VENUES_BY_CITY[sel_city].keys())[0])
-    sel_court = st.session_state.get("form_court", VENUES_BY_CITY[sel_city][sel_venue][0])
+    sel_city = st.session_state.get("form_city_select", list(VENUES_BY_CITY.keys())[0])
+    sel_venue = st.session_state.get("form_venue_select", list(VENUES_BY_CITY[sel_city].keys())[0])
+    sel_court = st.session_state.get("form_court_select", VENUES_BY_CITY[sel_city][sel_venue][0])
     timeline_df = df_all.copy() if not df_all.empty else pd.DataFrame()
     if not timeline_df.empty:
         timeline_df["start_dt"] = pd.to_datetime(timeline_df["date"], errors="coerce")
@@ -698,21 +687,17 @@ with tabs[fin_tab_index]:
     else:
         st.info("No bookings in selected range.")
 
-    # OPS should not see reconciliation/upload/ledger — stop here for ops
+    # Ops must not see reconciliation/upload/ledger/manual recon
     if role not in ("finance","admin"):
         st.warning("⚠ Finance-only actions are hidden. Contact Finance / Admin.")
         st.stop()
 
-    # ------------------------
-    # Finance-only: Manual Reconciliation & Upload & Ledger
-    # ------------------------
-    st.markdown("### 🔧 Manual Reconciliation")
+    # Finance/Admin only: reconciliation & upload & ledger
     # safe clearing flag before widget instantiation
     if st.session_state.get("fin_clear_flag"):
         st.session_state["fin_sel_recon"] = []
         del st.session_state["fin_clear_flag"]
 
-    # create multiselect
     sel = st.multiselect("Select Booking IDs to reconcile", df_f[(df_f["reconciled"]==0) | (df_f["amount_paid"] < df_f["amount"]) ]["booking_id"].tolist(), key="fin_sel_recon")
     bank_ref = st.text_input("Bank / Reference (enter bank reference)", key="fin_bank_ref")
     reconcile_date = st.date_input("Reconciled on", value=date.today(), key="fin_recon_date")
@@ -878,4 +863,4 @@ if role == "admin":
                 st.error(f"Upload failed: {e}")
 
 st.markdown("---")
-st.caption("SportVot Play — Final (Option B). Advance method saved only when advance > 0. Ops cannot access reconciliation/upload/ledger. For production: replace demo auth and SQLite with managed services.")
+st.caption("SportVot Play — Final update. City→Venue→Court fixed. Booking form clears on submit. Advance method saved only when amount_paid>0. Ops restricted from reconciliation/upload/ledger.")
