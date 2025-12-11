@@ -1,8 +1,7 @@
 # playy.py
-# SportVot Play — Final Robust Version (V5)
-# - FIX 1: Moved City selectbox OUTSIDE the form with on_change callback to resolve City/Venue mismatch.
-# - FIX 2: Removed explicit session state resets for form widgets (like entry_selected_slots) from the 'if submitted' block to resolve StreamlitAPIException. Clear_on_submit handles the reset.
-# - FIX 3: Advance Method selectbox is now hidden if Amount Paid is 0.
+# SportVot Play — Final Robust Version (V6)
+# - FIX 1: Removed explicit session state resets for canonical keys (form_venue, form_court) from the 'if submitted' block to resolve StreamlitAPIException.
+# - FIX 2: Reverted Advance Method UI hiding. It now always displays with a default option "N/A - Zero Advance" when amount paid is zero, satisfying the requirement for the column to be addressed in zero cases.
 
 import streamlit as st
 import pandas as pd
@@ -282,7 +281,6 @@ def update_venue_on_city_change():
         if courts:
             st.session_state["form_court"] = courts[0]
         else:
-            # Keep default in session state for fallback, but it won't be used immediately if courts is empty
             st.session_state["form_court"] = None
     else:
         st.session_state["form_venue"] = None
@@ -313,7 +311,8 @@ def login_form():
             st.session_state.setdefault("entry_amount_paid", 0.0)
             st.session_state.setdefault("entry_remarks", "")
             st.session_state.setdefault("entry_platform", PLATFORMS[0])
-            st.session_state.setdefault("entry_advance_method", ADVANCE_METHODS[0])
+            # Default for advance method state key on first run
+            st.session_state.setdefault("entry_advance_method_selection", "N/A - Zero Advance") 
             safe_rerun()
         else:
             st.sidebar.error("Invalid username or password")
@@ -387,31 +386,30 @@ if role in ("operations","admin"):
     with tabs[1]:
         st.header("✍️ Booking Entry")
 
-        # --- FIX: CITY SELECTION IS OUTSIDE THE FORM TO ALLOW on_change CALLBACK ---
+        # --- CITY SELECTION IS OUTSIDE THE FORM TO ALLOW on_change CALLBACK ---
         cities = list(VENUES_BY_CITY.keys())
         if st.session_state.get("form_city") not in cities:
             st.session_state["form_city"] = cities[0]
 
-        # Use the selectbox to set the canonical city key and run the reset callback
         st.selectbox(
             "Select City",
             cities,
             index=cities.index(st.session_state["form_city"]),
             key="form_city",
-            on_change=update_venue_on_city_change # This is the crucial fix for city/venue mismatch
+            on_change=update_venue_on_city_change # City change resets venue/court state
         )
         current_city = st.session_state["form_city"]
-        # --------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
 
         with st.form("booking_form", clear_on_submit=True):
-            # VENUE and COURT are now guaranteed to be in the correct city thanks to the callback above
+            # VENUE and COURT use canonical keys already set by the callback/initial state
             venues = list(VENUES_BY_CITY.get(current_city, {}).keys())
             if not venues:
                 st.error("No venues configured for this city.")
                 form_venue = None
                 form_court = None
             else:
-                # Fallback check: Ensure selected venue is valid for current city/callback reset (Index is crucial)
+                # Fallback check: Ensure selected venue is valid for current city (Index is crucial)
                 try:
                     venue_index = venues.index(st.session_state["form_venue"])
                 except ValueError:
@@ -449,7 +447,7 @@ if role in ("operations","admin"):
                 (df_now.get("venue") == form_venue) &
                 (df_now.get("court") == form_court) &
                 (df_now.get("date_only") == b_date)
-            ] if not df_now.empty and form_venue and form_court else pd.DataFrame() # Check if venue/court are valid
+            ] if not df_now.empty and form_venue and form_court else pd.DataFrame()
 
             booked_ranges = []
             for _, r in turf_bookings.iterrows():
@@ -474,6 +472,7 @@ if role in ("operations","admin"):
                 st.warning("No available time slots for this court & date. Choose another date/court.")
 
             slot_labels = [format_slot_range(s) for s in available_slots]
+            # multiselect uses its initial state from session_state.get if available
             selected_slot_labels = st.multiselect("Select contiguous half-hour slots (multi-select)", slot_labels, default=[], key="entry_selected_slots") if available_slots else []
             selected_slots = []
             for lbl in selected_slot_labels:
@@ -499,11 +498,20 @@ if role in ("operations","admin"):
             amount = st.number_input("Booking Amount (INR)", min_value=0, step=100, value=st.session_state.get("entry_amount", 1400), key="entry_amount")
             amount_paid = st.number_input("Advance Amount Received (INR)", min_value=0.0, step=50.0, value=st.session_state.get("entry_amount_paid", 0.0), key="entry_amount_paid")
             
-            # --- FIX: Advance Method only displayed if amount_paid > 0 ---
-            advance_method_ui = ""
-            if float(amount_paid) > 0:
-                st.selectbox("Advance payment received via", ADVANCE_METHODS, index=ADVANCE_METHODS.index(st.session_state.get("entry_advance_method", ADVANCE_METHODS[0])), key="entry_advance_method")
-                advance_method_ui = st.session_state.get("entry_advance_method", "")
+            # --- FIX: Advance Method always displayed with N/A option ---
+            ADVANCE_METHODS_UI = ["N/A - Zero Advance"] + ADVANCE_METHODS
+            
+            # Determine initial selection based on paid amount
+            adv_method_default = "N/A - Zero Advance"
+            if float(amount_paid) > 0 and st.session_state.get("entry_advance_method_selection") in ADVANCE_METHODS:
+                adv_method_default = st.session_state["entry_advance_method_selection"]
+
+            adv_method_selection = st.selectbox(
+                "Advance payment received via", 
+                ADVANCE_METHODS_UI, 
+                index=ADVANCE_METHODS_UI.index(adv_method_default), 
+                key="entry_advance_method_selection"
+            )
             # -------------------------------------------------------------
 
             remarks = st.text_input("Remarks (optional)", value=st.session_state.get("entry_remarks",""), key="entry_remarks", max_chars=200)
@@ -545,8 +553,12 @@ if role in ("operations","admin"):
                         new_id = get_next_booking_id(conn)
                         created_on = datetime.now().strftime(DATE_FORMAT)
                         turf_name = f"{current_city} | {form_venue} | {form_court}"
-                        # Save advance method only if amount was paid
-                        advance_method_to_save = advance_method_ui if float(amount_paid) > 0 else ""
+                        
+                        # --- Advance Method logic for DB saving ---
+                        advance_method_to_save = ""
+                        if float(amount_paid) > 0 and adv_method_selection != "N/A - Zero Advance":
+                            advance_method_to_save = adv_method_selection
+
                         new_row = {
                             "booking_id": new_id,
                             "created_on": created_on,
@@ -568,20 +580,12 @@ if role in ("operations","admin"):
                             "reconciled": 1 if float(amount_paid) >= float(amount) and amount > 0 else 0,
                             "bank_ref": "",
                             "reconciled_on": (datetime.now().strftime(DATE_FORMAT) if float(amount_paid) >= float(amount) and amount > 0 else ""),
-                            "advance_method": advance_method_to_save
+                            "advance_method": advance_method_to_save # Saved as "" if paid=0 or N/A selected
                         }
                         add_booking_db(conn, new_row)
 
-                        # We do NOT explicitly reset the entry_* session_state keys here because clear_on_submit=True handles the form widgets.
-                        # Only reset other keys if necessary (e.g. for success message context).
-
-                        # keep city but ensure valid venue/court defaults for current city (re-initialise state)
-                        st.session_state.setdefault("form_city", current_city)
-                        vs = list(VENUES_BY_CITY.get(current_city, {}).keys())
-                        if vs:
-                            st.session_state["form_venue"] = vs[0]
-                            st.session_state["form_court"] = VENUES_BY_CITY[current_city][vs[0]][0]
-                        # store success context and rerun
+                        # Store success context and rerun. 
+                        # DO NOT reset form_* keys here, the initial setup and clear_on_submit is sufficient.
                         st.session_state["last_booking"] = {
                             "booking_id": new_id,
                             "city": current_city, "venue": form_venue, "court": form_court,
