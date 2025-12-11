@@ -1,12 +1,8 @@
-# play.py
-# SportVot Play — Full updated final
-# - Canonical session keys: form_city, form_venue, form_court
-# - City->Venue->Court linkage fixed (no cross-city leakage)
-# - **[UPDATE] Added explicit check/reset for venue/court on city change for clean UI.**
-# - Booking form clears after submit (clear_on_submit + explicit session_state resets)
-# - Advance method visible always; saved only when amount_paid > 0 (Option B)
-# - Ops users hidden from reconciliation/upload/ledger/manual-reconcile
-# - Stable session_state handling to avoid widget-after-instantiation errors
+# playy.py
+# SportVot Play — Final with Canonical Session State Fix (V3)
+# - FIX: Implemented st.selectbox 'on_change' callback for robust City->Venue reset.
+# - Canonical session keys: form_city, form_venue, form_court maintained.
+# - All features (Login, DB, Booking, Reports, Finance, Admin) preserved.
 
 import streamlit as st
 import pandas as pd
@@ -274,6 +270,25 @@ if "user_store" not in st.session_state:
 if "df" not in st.session_state:
     st.session_state.df = load_bookings_df(st.session_state.conn)
 
+# --- CALLBACK FUNCTION FOR CITY/VENUE RESET ---
+def update_venue_on_city_change():
+    """Resets the venue and court to the default for the newly selected city."""
+    new_city = st.session_state["form_city"]
+    venues = list(VENUES_BY_CITY.get(new_city, {}).keys())
+    if venues:
+        default_venue = venues[0]
+        st.session_state["form_venue"] = default_venue
+        courts = VENUES_BY_CITY[new_city].get(default_venue, [])
+        if courts:
+            st.session_state["form_court"] = courts[0]
+        else:
+            st.session_state["form_court"] = None
+    else:
+        st.session_state["form_venue"] = None
+        st.session_state["form_court"] = None
+    # No need to call safe_rerun() here as Streamlit automatically reruns after a widget interaction
+# ---------------------------------------------
+
 # LOGIN / LOGOUT UI
 def login_form():
     st.sidebar.header("🔐 Login")
@@ -286,8 +301,8 @@ def login_form():
             st.session_state.role = store[user]["role"]
             st.sidebar.success(f"Signed in as {user} ({st.session_state.role})")
             # canonical defaults BEFORE widgets render
-            st.session_state.setdefault("form_city", list(VENUES_BY_CITY.keys())[0])
-            first_city = st.session_state["form_city"]
+            first_city = list(VENUES_BY_CITY.keys())[0]
+            st.session_state.setdefault("form_city", first_city)
             st.session_state.setdefault("form_venue", list(VENUES_BY_CITY[first_city].keys())[0])
             st.session_state.setdefault("form_court", VENUES_BY_CITY[first_city][st.session_state["form_venue"]][0])
             # booking defaults
@@ -371,39 +386,30 @@ if role in ("operations","admin"):
     with tabs[1]:
         st.header("✍️ Booking Entry")
 
-        # Get current city from state before form
-        current_city_on_load = st.session_state.get("form_city", list(VENUES_BY_CITY.keys())[0])
-
         with st.form("booking_form", clear_on_submit=True):
             # CITY (canonical)
             cities = list(VENUES_BY_CITY.keys())
-            if current_city_on_load not in cities:
-                current_city_on_load = cities[0] # Fallback if stored city is invalid
+            if st.session_state.get("form_city") not in cities:
+                st.session_state["form_city"] = cities[0]
 
-            st.selectbox("Select City", cities, index=cities.index(current_city_on_load), key="form_city")
+            # FIX: Use on_change callback to reset dependent fields immediately
+            st.selectbox(
+                "Select City",
+                cities,
+                index=cities.index(st.session_state["form_city"]),
+                key="form_city",
+                on_change=update_venue_on_city_change # <--- THIS IS THE FIX
+            )
             current_city = st.session_state["form_city"]
 
-            # --- City Change Logic ---
-            # If the city changed, reset venue/court to default for the new city
-            if current_city != current_city_on_load:
-                new_venues = list(VENUES_BY_CITY.get(current_city, {}).keys())
-                if new_venues:
-                    st.session_state["form_venue"] = new_venues[0]
-                    st.session_state["form_court"] = VENUES_BY_CITY[current_city][new_venues[0]][0]
-                else:
-                    st.session_state["form_venue"] = None
-                    st.session_state["form_court"] = None
-                safe_rerun()
-            # --------------------------
-
-            # Compute venues/courts for this city BEFORE creating widgets
+            # Compute venues/courts for this city
             venues = list(VENUES_BY_CITY.get(current_city, {}).keys())
             if not venues:
                 st.error("No venues configured for this city.")
                 form_venue = None
                 form_court = None
             else:
-                # Ensure selected venue is valid for current city
+                # Ensure selected venue is valid for current city (Fallback check)
                 if st.session_state.get("form_venue") not in venues:
                     st.session_state["form_venue"] = venues[0]
                 
@@ -415,7 +421,7 @@ if role in ("operations","admin"):
                     st.warning("No courts/turfs configured for this venue.")
                     form_court = None
                 else:
-                    # Ensure selected court is valid for current venue
+                    # Ensure selected court is valid for current venue (Fallback check)
                     if st.session_state.get("form_court") not in courts:
                         st.session_state["form_court"] = courts[0]
                         
@@ -617,17 +623,15 @@ with tabs[reports_tab_index]:
     st.write(f"Rows: {len(df_rep)}")
     st.dataframe(df_rep, height=350)
 
-    # Timeline for selected court & date (uses canonical session keys defaulting to current)
+    # Timeline for selected court & date
     st.markdown("### 🕒 Visual Timeline")
     t_date = st.date_input("Timeline Date", value=date.today(), key="timeline_date")
-    # Use canonical keys, fallback to defaults if not set (e.g., if user skipped Booking Entry tab)
+    # Use canonical keys, falling back to defaults if not set
     sel_city = st.session_state.get("form_city", list(VENUES_BY_CITY.keys())[0])
-    sel_venue = st.session_state.get("form_venue")
-    if not sel_venue:
-        sel_venue = list(VENUES_BY_CITY.get(sel_city, {}).keys())[0] if VENUES_BY_CITY.get(sel_city) else None
-    sel_court = st.session_state.get("form_court")
-    if not sel_court and sel_venue:
-        sel_court = VENUES_BY_CITY.get(sel_city, {}).get(sel_venue, [None])[0]
+    venues_for_sel_city = list(VENUES_BY_CITY.get(sel_city, {}).keys())
+    sel_venue = st.session_state.get("form_venue", venues_for_sel_city[0] if venues_for_sel_city else None)
+    courts_for_sel_venue = VENUES_BY_CITY.get(sel_city, {}).get(sel_venue, [])
+    sel_court = st.session_state.get("form_court", courts_for_sel_venue[0] if courts_for_sel_venue else None)
         
     st.markdown(f"Timeline for: **{sel_city} | {sel_venue} | {sel_court}**")
         
